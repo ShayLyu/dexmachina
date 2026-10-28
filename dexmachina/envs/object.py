@@ -60,6 +60,20 @@ def get_arctic_object_cfg(name="box", convexify=True, decomp=True, texture_mesh=
     assert os.path.exists(obj_cfg['top_mesh_fname']), f"{obj_cfg['top_mesh_fname']} does not exist"
     return obj_cfg
 
+def override_object_assets(obj_cfg, asset_dir):
+    """Swap in a generated variant (same link frames and joint as the ARCTIC object), e.g. from
+    tools/gen_lids.py. Uses <asset_dir>/<dirname>.urdf and any top/bottom meshes the variant provides."""
+    asset_dir = os.path.abspath(asset_dir)
+    urdf_path = join(asset_dir, os.path.basename(asset_dir) + ".urdf")
+    assert os.path.exists(urdf_path), f"{urdf_path} does not exist"
+    obj_cfg["urdf_path"] = urdf_path
+    for part in ["top", "bottom"]:
+        fname = join(asset_dir, f"{part}_watertight_tiny.stl")
+        if os.path.exists(fname):
+            obj_cfg[f"{part}_mesh_fname"] = fname
+    print(f"Using object variant: {urdf_path}")
+    return obj_cfg
+
  
 class ArticulatedObject:
     """ Assume only one joint """

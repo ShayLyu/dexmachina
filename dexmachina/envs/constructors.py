@@ -5,7 +5,7 @@ from dexmachina.envs.base_env import BaseEnv, get_env_cfg
 from dexmachina.envs.randomizations import get_randomization_cfg
 from dexmachina.envs.curriculum import get_curriculum_cfg
 from dexmachina.envs.maniptrans_curr import get_maniptrans_cfg
-from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg
+from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg, override_object_assets
 from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg
 from dexmachina.envs.rewards import RewardModule, get_reward_cfg
 from dexmachina.envs.contact_shaping import get_contact_shaping_cfg
@@ -144,6 +144,8 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     object_cfgs = {
         obj_name: get_arctic_object_cfg(name=obj_name, convexify=args.convexify_object, texture_mesh=args.texture_object)
     } 
+    if args.object_asset_dir is not None:
+        override_object_assets(object_cfgs[obj_name], args.object_asset_dir)
     if args.fix_object:
         # object base is welded at its demo pose; only the articulation joint moves
         object_cfgs[obj_name]['fixed'] = True
@@ -257,6 +259,7 @@ def get_common_argparser():
     parser.add_argument('--hand', type=str, default='inspire_hand')
     parser.add_argument('--sides', type=str, nargs='+', default=['left', 'right'], choices=['left', 'right'], help='which hands to put in the env')
     parser.add_argument('--fix_object', action='store_true', help='fix the object base; use with a fixed-base clip, e.g. subject s01fb')
+    parser.add_argument('--object_asset_dir', type=str, default=None, help='generated object variant, e.g. from tools/gen_lids.py')
     # DemoMimic contact rewards, see envs/contact_shaping.py
     parser.add_argument('--ar_weight', type=float, default=0.0, help='alignment reward weight')
     parser.add_argument('--scr_weight', type=float, default=0.0, help='sustained contact reward weight')

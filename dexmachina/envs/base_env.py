@@ -1075,7 +1075,10 @@ class BaseEnv:
                 rgb_frames = np.clip(rgb_frames, 0, 255).astype(np.uint8)                 
                 rgb_frames = [rgb_frames[i] for i in range(len(rgb_frames))]
             path = path + ".mp4" if not path.endswith(".mp4") else path
-            from moviepy.editor import ImageSequenceClip 
+            try:
+                from moviepy import ImageSequenceClip # moviepy 2.x
+            except ImportError:
+                from moviepy.editor import ImageSequenceClip
             clip = ImageSequenceClip(rgb_frames, fps=int(1/self.dt/2))
             clip.write_videofile(path) 
         return frames

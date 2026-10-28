@@ -18,6 +18,7 @@ from dexmachina.asset_utils import get_rl_config_path
 from dexmachina.envs.base_env import BaseEnv
 from dexmachina.envs.contacts import get_contact_marker_cfgs
 from dexmachina.envs.constructors import get_common_argparser, parse_clip_string  
+from dexmachina.envs.object import override_object_assets
 from dexmachina.rl.rl_games_wrapper import RlGamesVecEnvWrapper, RlGamesGpuEnv
 
   
@@ -64,10 +65,6 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
             print("Setting eval time obj gains to 0.0")
             obj.set_joint_gains(0.0, 0.0, force_range=0.0)
     assert obj is not None, "No object found in the environment"
-    left_hand = uenv.robots["left"]
-    right_hand = uenv.robots["right"]
-    joint_target_left = left_hand.residual_qpos
-    joint_target_right = right_hand.residual_qpos
     
     eval_data = defaultdict(list)
     for i in range(ep_len):
@@ -79,15 +76,15 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
                     
             if show_reference: # visualize the demo traj and set zero action
                 obj.set_object_state(
-                    root_pos=state[:, :3][None],
-                    root_quat=state[:, 3:7][None],
-                    joint_qpos=state[:, 7][None],
+                    root_pos=demo_state[:3][None],
+                    root_quat=demo_state[3:7][None],
+                    joint_qpos=demo_state[7:8][None],
                     env_idxs=torch.tensor([1], dtype=torch.int32, device=device),
                 )
                 actions[-1, :] = -1.0 
-                for robot, joints in zip([left_hand, right_hand], [joint_target_left, joint_target_right]):
+                for robot in uenv.robots.values():
                     robot.set_joint_position(
-                        joint_targets=joints[env_step][None],
+                        joint_targets=robot.residual_qpos[env_step][None],
                         env_idxs=[1],
                     ) 
             obs, rew, dones, infos = env.step(actions) 
@@ -98,7 +95,7 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
             eval_data["demo_state"].append(demo_state.cpu().numpy())
 
             rew_dict = uenv.rew_dict
-            for key in ['pos_dist', 'rot_dist', 'arti_dist']:
+            for key in ['pos_dist', 'rot_dist', 'arti_dist', 'task_rew']:
                 eval_data[key].append(rew_dict[key].cpu().numpy())
             if len(dones) > 0:
                 # reset rnn state for terminated episodes
@@ -114,8 +111,25 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
                 if 'con' in k:
                     print(f"Step {env_step}: {k}: {v.cpu().numpy()}")
     eval_data = {k: np.stack(v) for k, v in eval_data.items()}
-    frames = uenv.get_recorded_frames()
+    frames = uenv.get_recorded_frames(wait_for_max=False)
     return frames, eval_data
+
+
+def summarize_episode(eval_data, uenv, arti_tol):
+    """Lid tracking without any object assist. Env 0 is the policy (the last env is skipped in eval mode)."""
+    obj_arti = eval_data["obj_state"][:, 0, 7]
+    demo_arti = eval_data["demo_state"][:, 7]
+    err = np.abs(obj_arti - demo_arti)
+    summary = dict(
+        arti_err_mean=float(err.mean()),
+        arti_err_max=float(err.max()),
+        max_open_policy=float(obj_arti.max()),
+        max_open_demo=float(demo_arti.max()),
+        task_rew_mean=float(eval_data["task_rew"][:, 0].mean()),
+        success=bool(err.max() < arti_tol),
+    )
+    print("Eval summary (env 0): " + ", ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in summary.items()))
+    return summary
 
 
 def main():
@@ -128,6 +142,7 @@ def main():
     parser.add_argument('--output_render', '-or', action='store_true') # if not ture, don't show the retargeted reference
     parser.add_argument('--render_dir', '-out', type=str, default="rendered") # if not provided, save in the same folder as the checkpoint
     parser.add_argument('--video_fname', '-of', type=str, default="-eval.mp4") # if not provided, save in the same folder as the checkpoint
+    parser.add_argument('--arti_tol', type=float, default=0.3, help='success if |lid angle - demo| stays below this (rad) for the whole episode')
     
     args = parser.parse_args()
 
@@ -137,6 +152,8 @@ def main():
     ckpt_name = f"{args.checkpoint.split('/')[-1]}" # inpsire_ep1000 etc
     run_name = f"{args.checkpoint.split('/')[-3]}" # inpsire_ep1000 etc
     ckpt_data_folder = os.path.join(ckpt_path, ckpt_name.replace(".pth", "_eval"))
+    if args.object_asset_dir is not None:
+        ckpt_data_folder = os.path.join(ckpt_data_folder, os.path.basename(os.path.abspath(args.object_asset_dir)))
     os.makedirs(ckpt_data_folder, exist_ok=True) 
 
     video_fname = join(ckpt_data_folder, f"video.mp4")
@@ -157,6 +174,7 @@ def main():
         env_kwargs['env_cfg']['scene_kwargs']['raytrace'] = True
 
     env_kwargs['env_cfg']['early_reset_threshold'] = 0.0
+    env_kwargs['env_cfg']['contact_shaping'] = None # AR/SCR are training rewards; their cache is per object
     print("WARNING: setting env.is_eval to True")
     env_kwargs['env_cfg']['is_eval'] = True
     if args.vis:
@@ -171,7 +189,7 @@ def main():
                 num_vis_contacts=16,
                 sources=['demo'],
                 obj_parts=['top', 'bottom'],
-                hand_sides=['left', 'right'],
+                hand_sides=list(env_kwargs['robot_cfgs'].keys()),
             )
         env_kwargs['contact_marker_cfgs'] = marker_cfgs
         print('Setting visualize contact to True but observe contact force to False')
@@ -193,6 +211,8 @@ def main():
     for name, cfg in env_kwargs['object_cfgs'].items():
         print("Setting eval time obj gains to 0.0")
         cfg['actuated'] = False
+        if args.object_asset_dir is not None: # evaluate on a different object variant
+            override_object_assets(cfg, args.object_asset_dir)
 
     if args.overlay:
         env_kwargs['env_cfg']['env_spacing'] = (0.0, 0.0)
@@ -238,6 +258,7 @@ def main():
         frames, eval_data = eval_one_episode(
             env, agent, obj_state_tensor, args.print_rew, args.record_video, args.show_reference
             )
+        eval_data["summary"] = summarize_episode(eval_data, uenv, args.arti_tol)
         ckpt_eval_fname = os.path.join(ckpt_data_folder, f"eval_ep{eps}.npy")
         np.save(ckpt_eval_fname, eval_data)
         print(f"Saved eval data to {ckpt_eval_fname}")
@@ -245,8 +266,11 @@ def main():
         # eval_data = np.load(ckpt_eval_fname, allow_pickle=True).item() 
         if args.record_video: 
             # save video with moviepy
-            from moviepy.editor import ImageSequenceClip
-            clip = ImageSequenceClip(frames, fps=int(1/uenv.dt/2))
+            try:
+                from moviepy import ImageSequenceClip # moviepy 2.x
+            except ImportError:
+                from moviepy.editor import ImageSequenceClip
+            clip = ImageSequenceClip([f[:, :, :3] for f in frames], fps=int(1/uenv.dt/2))
             clip.write_videofile(video_fname)
             print(f"Saved video to {video_fname}")
     
