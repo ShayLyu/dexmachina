@@ -172,6 +172,7 @@ class ArticulatedObject:
         assert all([isinstance(joint.dof_idx_local, int) for joint in movable_joints]), "Only one dof per joint is supported"
         self.dof_idxs = [joint.dof_idx_local for joint in movable_joints]
         self.actuated = self.cfg.get("actuated", False)
+        self.fixed = self.cfg.get("fixed", False)
         
         self.entity = entity
         self.initialize_value_buffers()
@@ -287,8 +288,7 @@ class ArticulatedObject:
     def set_joint_gains(self, kp=None, kv=None, force_range=None, env_idxs=None):
         
         num_envs = self.num_envs if env_idxs is None else len(env_idxs)
-        dof_idxs = self.dof_idxs
-        dof_idxs = [i for i in range(7)]
+        dof_idxs = [i for i in range(self.entity.n_dofs)] # 6 root + 1 joint, or just the joint if fixed
         num_dofs = len(dof_idxs)
         if kp is not None:
             batched_kp = self.fill_gain_tensor(kp, num_dofs, num_envs, self.device) 
@@ -406,7 +406,7 @@ class ArticulatedObject:
             env_idxs = np.arange(self.num_envs)
         
         if self.actuated and reset_gains:
-            dof_idxs = [i for i in range(7)]
+            dof_idxs = [i for i in range(self.entity.n_dofs)]
             num_dofs = len(dof_idxs) 
             rand_scale = torch.rand((len(env_idxs), 1)) * 0.3 + 0.7 # range [0.5, 1.0]
             kp = torch.ones(len(env_idxs), num_dofs) * self.kp * rand_scale
@@ -429,19 +429,21 @@ class ArticulatedObject:
         if episode_start is not None and torch.any(episode_start):
             init_pos = self.demo_states[episode_start, :3].clone()
         self.root_pos[env_idxs, :] = init_pos
-        self.entity.set_pos(
-            pos=self.root_pos[env_idxs],
-            envs_idx=env_idxs,
-        )
+        if not self.fixed: # a fixed base is already at its pose
+            self.entity.set_pos(
+                pos=self.root_pos[env_idxs],
+                envs_idx=env_idxs,
+            )
 
         init_quat = self.init_quat
         if episode_start is not None and torch.any(episode_start):
             init_quat = self.demo_states[episode_start, 3:7].clone()
         self.root_quat[env_idxs, :] = init_quat
-        self.entity.set_quat(
-            quat=self.root_quat[env_idxs],
-            envs_idx=env_idxs,
-        )
+        if not self.fixed:
+            self.entity.set_quat(
+                quat=self.root_quat[env_idxs],
+                envs_idx=env_idxs,
+            )
 
         self.root_ang_vel[env_idxs, :] = 0.0
         self.root_lin_vel[env_idxs, :] = 0.0
@@ -463,18 +465,17 @@ class ArticulatedObject:
         assert self.initialized, "Object not initialized"
         if root_pos.shape == (3,):
             root_pos = root_pos[None]
-        
-        self.entity.set_pos(
-            pos=root_pos,
-            envs_idx=env_idxs,
-        )
-
         if root_quat.shape == (4,):
             root_quat = root_quat[None]
-        self.entity.set_quat(
-            quat=root_quat, 
-            envs_idx=env_idxs,
-        )
+        if not self.fixed: # a fixed base is already at its pose
+            self.entity.set_pos(
+                pos=root_pos,
+                envs_idx=env_idxs,
+            )
+            self.entity.set_quat(
+                quat=root_quat, 
+                envs_idx=env_idxs,
+            )
 
         if len(joint_qpos.shape) == 1:
             joint_qpos = joint_qpos[None]

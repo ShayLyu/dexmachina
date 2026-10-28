@@ -4,6 +4,7 @@ import numpy as np
 import genesis as gs 
 from dexmachina.envs.robot import BaseRobot
 from dexmachina.envs.object import ArticulatedObject
+from dexmachina.envs.contact_shaping import ContactShaping
 from dexmachina.envs.rewards import RewardModule
 from dexmachina.envs.math_utils import matrix_from_quat
 from dexmachina.envs.contacts import get_filtered_contacts
@@ -210,7 +211,7 @@ class BaseEnv:
             print('Setting the SAME collision grouping to both hands')
             self.scene_cfg['rigid_options'].enable_self_collision = True
             self.scene_cfg['rigid_options'].self_collision_group_filter = True
-            collision_groups = robot_cfgs['left'].get('collision_groups', dict())
+            collision_groups = next(iter(robot_cfgs.values())).get('collision_groups', dict())
             self.scene_cfg['rigid_options'].link_group_mapping = collision_groups
         if render_figure:
             print("Disabling gravity for figure rendering")
@@ -368,6 +369,11 @@ class BaseEnv:
         rand_cfg = self.rand_cfg
         self.setup_actions(self.robots) 
         self.observe_tip_dist = env_cfg['observe_tip_dist']
+        shaping_cfg = env_cfg.get('contact_shaping') or dict()
+        self.use_contact_shaping = any(shaping_cfg.get(k, 0.0) > 0 for k in ['ar_weight', 'scr_weight', 'arm_vel_penalty', 'finger_vel_penalty'])
+        if self.use_contact_shaping:
+            assert env_cfg.get('observe_contact_force', False) and env_cfg.get('use_contact_reward', False), \
+                "AR/SCR need per-link contact positions and forces"
         if self.observe_tip_dist:
             # load vertices
             assert self.n_objects == 1, "Only support one object for now"
@@ -384,14 +390,23 @@ class BaseEnv:
             self.num_robot_links = sum([len(robot.coll_idxs_global) for robot in self.robots.values()])
 
             self.filter_links_a = torch.tensor(self.object.coll_idxs_global, device=self.device)
-            self.filter_links_b = torch.tensor(
-                self.robots['left'].coll_idxs_global + self.robots['right'].coll_idxs_global, 
-                device=self.device
-                )
-            self.num_left_contact_links = len(self.robots['left'].coll_idxs_global)
+            # robot contact links are concatenated in self.robots order; keep each hand's slice
+            robot_links = []
+            self.contact_link_slices = dict()
+            for side, robot in self.robots.items():
+                start = len(robot_links)
+                robot_links += robot.coll_idxs_global
+                self.contact_link_slices[side] = slice(start, len(robot_links))
+            self.filter_links_b = torch.tensor(robot_links, device=self.device)
 
             print("num_obj_links", self.num_obj_links) 
         
+
+        self.contact_shaping = None
+        if self.use_contact_shaping:
+            self.contact_shaping = ContactShaping(
+                shaping_cfg, self.robots, self.object, self.num_envs, self.device, self.contact_link_slices,
+            )
 
         self.obs_dim, self.obs_idxs = self.compute_obs_dim() 
         self.num_obs = self.obs_dim
@@ -469,7 +484,7 @@ class BaseEnv:
             obs_idxs[k] = (obs_dim, obs_dim + dim)
             obs_dim += dim
         if self.observe_tip_dist:
-            n_kpts = self.robots['left'].n_kpts + self.robots['right'].n_kpts
+            n_kpts = sum(robot.n_kpts for robot in self.robots.values())
             obs_dim += n_kpts * 2 # because two obj parts!
         
         if self.observe_contact_force:
@@ -515,8 +530,10 @@ class BaseEnv:
         # approximate dist from hand kpt to object surface
         num_obj_parts = 2 
         if self.observe_tip_dist:
-            self.kpt_dists_left = torch.zeros((self.num_envs, self.robots['left'].n_kpts, num_obj_parts), device=self.device)
-            self.kpt_dists_right = torch.zeros((self.num_envs, self.robots['right'].n_kpts, num_obj_parts), device=self.device)
+            self.kpt_dists = {
+                side: torch.zeros((self.num_envs, robot.n_kpts, num_obj_parts), device=self.device)
+                for side, robot in self.robots.items()
+            }
 
         if self.observe_contact_force:
             self.contact_forces = torch.zeros((self.num_envs, self.num_obj_links,  self.num_robot_links, 3), device=self.device) 
@@ -625,8 +642,7 @@ class BaseEnv:
             self.extras["log"]["contact_force"] = torch.norm(self.contact_forces, dim=-1).max().item()
         
         # get control_force 
-        for side in ['left', 'right']:
-            robot = self.robots[side]
+        for side, robot in self.robots.items():
             control_force = robot.get_control_force()
             self.extras["log"][f"{side}_control_force"] = control_force.mean().item()
 
@@ -656,23 +672,17 @@ class BaseEnv:
             obj_pos=obj_pos,
             obj_quat=obj_quat,
             obj_arti=obj_arti,
-            kpts_left=self.robots['left'].kpt_pos,
-            kpts_right=self.robots['right'].kpt_pos,
+            kpts={side: robot.kpt_pos for side, robot in self.robots.items()},
             episode_length_buf=self.episode_length_buf,
-            contact_link_pos_left=None,
-            contact_link_valid_left=None,
-            contact_link_pos_right=None,
-            contact_link_valid_right=None,
-            wrist_pose_left=self.robots['left'].wrist_pose,
-            wrist_pose_right=self.robots['right'].wrist_pose,
+            contact_link_pos=None,
+            contact_link_valid=None,
+            wrist_poses={side: robot.wrist_pose for side, robot in self.robots.items()},
             contact_forces=None,
             )
         if self.use_contact_reward:
             reward_kwargs.update(
-                contact_link_pos_left=self.contact_link_pos[:, :, :self.num_left_contact_links], # N, 2, 13, 3
-                contact_link_valid_left=self.contact_link_valid[:, :, :self.num_left_contact_links],
-                contact_link_pos_right=self.contact_link_pos[:, :, self.num_left_contact_links:],
-                contact_link_valid_right=self.contact_link_valid[:, :, self.num_left_contact_links:],
+                contact_link_pos={side: self.contact_link_pos[:, :, sl] for side, sl in self.contact_link_slices.items()}, # N, 2, 13, 3
+                contact_link_valid={side: self.contact_link_valid[:, :, sl] for side, sl in self.contact_link_slices.items()},
             )
         if self.observe_contact_force:
             reward_kwargs.update(
@@ -681,6 +691,12 @@ class BaseEnv:
         rewards, rew_dict = self.reward_module.compute_reward(
             **reward_kwargs
         )
+        if self.contact_shaping is not None:
+            shaping_rew, shaping_dict = self.contact_shaping.compute(
+                self.contact_link_pos, self.contact_link_valid, self.contact_forces, self.episode_length_buf,
+            )
+            rewards = rewards + shaping_rew
+            rew_dict.update(shaping_dict)
         
         if not self.use_rl_games:
             # scale the reward by 0.1 manually to match the scale in rl_games
@@ -757,10 +773,7 @@ class BaseEnv:
             _pos[~self.contact_link_valid] = 0
             part_idx = 0 if part == 'top' else 1
             _pos = _pos[:, part_idx, :]
-            if side == 'left':
-                _pos = _pos[:, :self.num_left_contact_links]    
-            else:
-                _pos = _pos[:, self.num_left_contact_links:]
+            _pos = _pos[:, self.contact_link_slices[side]]
 
         else:        
             _pos = self.reward_module.match_demo_state(f'contact_links_{side}', self.episode_length_buf) # (N, 2*nlinks, 4) -> last dim is part id
@@ -820,8 +833,6 @@ class BaseEnv:
             obs_dict = obj.get_observations()
             value_list.extend(list(obs_dict.values()))
             all_obs_dict[name] = obs_dict
-        left = self.robots['left']
-        right = self.robots['right'] 
         # contact_info = left.entity.get_contacts(obj.entity)
         # force, mask = contact_info['force_a'], contact_info['valid_mask']
         # print(force[mask].shape)
@@ -838,7 +849,7 @@ class BaseEnv:
             assert self.n_objects == 1, "Only support one object for now"
             obj = self.objects[self.object_names[0]]
             # compute the kpt distances to the object surface
-            for side, dists_tensor in zip(['left', 'right'], [self.kpt_dists_left, self.kpt_dists_right]):
+            for side, dists_tensor in self.kpt_dists.items():
                 robot = self.robots[side]
                 for i, part in enumerate(['top', 'bottom']):
                     part_pose = obj.get_part_pose(part)
@@ -847,10 +858,7 @@ class BaseEnv:
                     )
                     name = f"{side}_kpt_dist_{part}"
                     # print(name, np.round(dists_tensor[:, :, i].cpu().numpy(), 2))
-            value_list.extend([
-                self.kpt_dists_left.flatten(start_dim=1),
-                self.kpt_dists_right.flatten(start_dim=1),
-                ])
+            value_list.extend([dists.flatten(start_dim=1) for dists in self.kpt_dists.values()])
 
         if self.observe_contact_force:
             force_norm = torch.norm(self.contact_forces, dim=-1) * 0.01 # scale down! max contact force can go to 1000+
@@ -925,6 +933,8 @@ class BaseEnv:
         
         for k, obj in self.objects.items():
             obj.reset_idx(env_idxs, self.episode_start_buf[env_idxs])
+        if self.contact_shaping is not None:
+            self.contact_shaping.reset_idx(env_idxs)
 
         self.last_actions[env_idxs] = 0.0
         
@@ -942,8 +952,8 @@ class BaseEnv:
 
         # self._compute_intermediate_values()
         if self.observe_tip_dist:
-            self.kpt_dists_left[env_idxs] = 0.0
-            self.kpt_dists_right[env_idxs] = 0.0
+            for dists in self.kpt_dists.values():
+                dists[env_idxs] = 0.0
         
         if self.observe_contact_force:
             self.contact_forces[env_idxs] = 0.0

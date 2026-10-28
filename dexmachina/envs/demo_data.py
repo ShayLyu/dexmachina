@@ -29,9 +29,10 @@ def get_demo_data(
         "obj_pos": demo_data["obj_trans"][frame_start:frame_end], 
         "obj_quat": demo_data["obj_quat"][frame_start:frame_end],
         "obj_arti": demo_data["obj_arti"][frame_start:frame_end], 
-        "contact_links_left": world_coord["contact_links_left"][frame_start:frame_end],
-        "contact_links_right": world_coord["contact_links_right"][frame_start:frame_end],
     }
+    for side in ['left', 'right']: # single-hand clips only store one side
+        if f"contact_links_{side}" in world_coord:
+            demo_data[f"contact_links_{side}"] = world_coord[f"contact_links_{side}"][frame_start:frame_end]
     if load_retarget_contact:
         retar_contact = load_contact_retarget_data(
             obj_name=obj_name, hand_name=hand_name, frame_start=frame_start, frame_end=frame_end,
@@ -94,7 +95,7 @@ def load_genesis_retarget_data(
 
     retarget_loaded = data["retarget_data"] 
     retarget_data = dict()
-    for side in ['left', 'right']:
+    for side in retarget_loaded.keys():
         loaded = retarget_loaded[side]
         residual_qpos = loaded["joint_qpos"]
         sliced_qpos = {k: v[frame_start:frame_end] for k, v in residual_qpos.items()}
@@ -144,7 +145,7 @@ def load_contact_retarget_data(
     assert os.path.exists(fname), f"File {fname} not found"
     loaded = np.load(fname, allow_pickle=True).item()
     retar_contact = dict()
-    for side in ['left', 'right']:
+    for side in loaded.keys():
         data = loaded[side] 
         for source_key, target_key in zip(
             ["dexlink_contacts", "dexlink_valid_contacts"],

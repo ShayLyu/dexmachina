@@ -8,6 +8,7 @@ from dexmachina.envs.maniptrans_curr import get_maniptrans_cfg
 from dexmachina.envs.object import ArticulatedObject, get_arctic_object_cfg
 from dexmachina.envs.robot import BaseRobot, get_default_robot_cfg
 from dexmachina.envs.rewards import RewardModule, get_reward_cfg
+from dexmachina.envs.contact_shaping import get_contact_shaping_cfg
 from dexmachina.envs.demo_data import get_demo_data, load_genesis_retarget_data 
 
 def parse_clip_string(clip):
@@ -38,6 +39,7 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     reward_cfg['use_retarget_contact'] = args.use_retarget_contact 
     reward_cfg['retarget_objframe'] = not args.retarget_worldfr
     reward_cfg['action_penalty'] = args.action_penalty
+    reward_cfg['sides'] = list(args.sides)
 
     if args.objdex_baseline:
         print("Setting action mode to hybrid for objdex baseline and task rew beta to lower")
@@ -106,7 +108,15 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     env_cfg['observe_tip_dist'] = args.observe_tip_dist
     env_cfg['observe_contact_force'] = True #ve_contact_force
     print(f"Setting observe_contact_force to True")
-    env_cfg['use_contact_reward'] = args.contact_rew_weight > 0
+    shaping_cfg = get_contact_shaping_cfg()
+    shaping_cfg.update(
+        ar_weight=args.ar_weight, scr_weight=args.scr_weight, ar_scale=args.ar_scale,
+        contact_force_thres=args.contact_force_thres, arm_vel_penalty=args.arm_vel_penalty,
+        finger_vel_penalty=args.finger_vel_penalty, cache_path=args.contact_cache,
+    )
+    env_cfg['contact_shaping'] = shaping_cfg
+    # AR needs the per-link contact positions that the contact reward uses
+    env_cfg['use_contact_reward'] = args.contact_rew_weight > 0 or args.ar_weight > 0 or args.scr_weight > 0
     env_cfg['use_rl_games'] = args.use_rl_games
     env_cfg['rand_init_ratio'] = args.rand_init_ratio  
     env_cfg['chunk_ep_length'] = args.chunk_ep_length
@@ -121,11 +131,8 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
             print(f"Using white plane for raytracing")
             env_cfg['plane_urdf_path'] = 'assets/plane/plane_custom.urdf'
         env_cfg["max_video_frames"] = int(2 * ep_len)
-    robot_cfgs = {
-        'left': get_default_robot_cfg(name=args.hand, side='left'),
-        'right': get_default_robot_cfg(name=args.hand, side='right')
-    }
-    for side in ['left', 'right']: 
+    robot_cfgs = {side: get_default_robot_cfg(name=args.hand, side=side) for side in args.sides}
+    for side in args.sides: 
         robot_cfgs[side]['action_mode'] = args.action_mode
         robot_cfgs[side]['hybrid_scales'] = tuple(args.hybrid_scales)
         robot_cfgs[side]['res_cap'] = args.res_cap
@@ -137,6 +144,9 @@ def get_all_env_cfg(args, device, load_retarget_data=True):
     object_cfgs = {
         obj_name: get_arctic_object_cfg(name=obj_name, convexify=args.convexify_object, texture_mesh=args.texture_object)
     } 
+    if args.fix_object:
+        # object base is welded at its demo pose; only the articulation joint moves
+        object_cfgs[obj_name]['fixed'] = True
     if args.actuate_object:
         object_cfgs[obj_name]['actuated'] = True
         object_cfgs[obj_name]['kp'] = args.kp_init 
@@ -245,6 +255,16 @@ def get_common_argparser():
 
     parser.add_argument('--arctic_object', '-ao', type=str, default='box')
     parser.add_argument('--hand', type=str, default='inspire_hand')
+    parser.add_argument('--sides', type=str, nargs='+', default=['left', 'right'], choices=['left', 'right'], help='which hands to put in the env')
+    parser.add_argument('--fix_object', action='store_true', help='fix the object base; use with a fixed-base clip, e.g. subject s01fb')
+    # DemoMimic contact rewards, see envs/contact_shaping.py
+    parser.add_argument('--ar_weight', type=float, default=0.0, help='alignment reward weight')
+    parser.add_argument('--scr_weight', type=float, default=0.0, help='sustained contact reward weight')
+    parser.add_argument('--ar_scale', type=float, default=0.5, help='cosine similarity rescale factor s for AR')
+    parser.add_argument('--contact_force_thres', type=float, default=1.0, help='min force (N) for a link to count as in contact')
+    parser.add_argument('--arm_vel_penalty', type=float, default=0.0)
+    parser.add_argument('--finger_vel_penalty', type=float, default=0.0)
+    parser.add_argument('--contact_cache', type=str, default=None, help='cache from tools/build_contact_cache.py')
     parser.add_argument('--frame_start', '-fs', type=int, default=40)
     parser.add_argument('--frame_end', '-fe', type=int, default=200)
     parser.add_argument('--clip', '-cl', type=str, default="box-40-200-s01-u01")
