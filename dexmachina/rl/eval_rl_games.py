@@ -115,21 +115,54 @@ def eval_one_episode(env, agent, obj_state_tensor, print_rew=False, record_video
     return frames, eval_data
 
 
-def summarize_episode(eval_data, uenv, arti_tol):
-    """Lid tracking without any object assist. Env 0 is the policy (the last env is skipped in eval mode)."""
-    obj_arti = eval_data["obj_state"][:, 0, 7]
-    demo_arti = eval_data["demo_state"][:, 7]
+def summarize_episode(eval_data, uenv, arti_tol, open_ratio=0.75, overshoot=0.3, closed_tol=0.2):
+    """Lid tracking without any object assist, per policy env (the last env is skipped in eval mode).
+    Two success criteria:
+      success_track: |lid angle - demo| stays below arti_tol for the whole episode (strict).
+      success_task:  the lid opens to at least open_ratio * demo max, never past demo max + overshoot,
+                     and ends closed (< closed_tol). This is the open-then-close task itself.
+    Env 0 is the unperturbed one; scalar fields without a suffix are means over policy envs."""
+    n = uenv.num_envs - 1 if uenv.num_envs > 1 else 1
+    obj_arti = eval_data["obj_state"][:, :n, 7] # (T, n)
+    demo_arti = eval_data["demo_state"][:, 7][:, None]
     err = np.abs(obj_arti - demo_arti)
+    demo_max = float(demo_arti.max())
+    max_open = obj_arti.max(0)
+    track = err.max(0) < arti_tol
+    task = (max_open >= open_ratio * demo_max) & (max_open <= demo_max + overshoot) & (obj_arti[-1] < closed_tol)
     summary = dict(
+        n_envs=int(n),
         arti_err_mean=float(err.mean()),
-        arti_err_max=float(err.max()),
-        max_open_policy=float(obj_arti.max()),
-        max_open_demo=float(demo_arti.max()),
-        task_rew_mean=float(eval_data["task_rew"][:, 0].mean()),
-        success=bool(err.max() < arti_tol),
+        arti_err_max=float(err.max(0).mean()),
+        max_open_policy=float(max_open.mean()),
+        max_open_demo=demo_max,
+        task_rew_mean=float(eval_data["task_rew"][:, :n].mean()),
+        success_track=float(track.mean()),
+        success_task=float(task.mean()),
+        success=float(task.mean()),
+        env0=dict(arti_err_mean=float(err[:, 0].mean()), arti_err_max=float(err[:, 0].max()),
+                  max_open_policy=float(max_open[0]), success_track=bool(track[0]), success_task=bool(task[0])),
+        per_env=dict(arti_err_mean=err.mean(0).tolist(), max_open_policy=max_open.tolist(),
+                     success_track=track.tolist(), success_task=task.tolist()),
     )
-    print("Eval summary (env 0): " + ", ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in summary.items()))
+    print("Eval summary (%d envs): " % n + ", ".join(f"{k}={v:.3f}" for k, v in summary.items() if isinstance(v, float)))
     return summary
+
+
+def randomize_physics(uenv, friction=(0.7, 1.3), obj_mass=(-0.03, 0.03), seed=0):
+    """Per-env physics perturbation for eval: friction ratio on every geom and a mass shift (kg) on the
+    object's links. Env 0 keeps the nominal physics. Values are fixed for the whole run (no per-reset resampling)."""
+    g = torch.Generator().manual_seed(seed)
+    n = uenv.num_envs
+    solver = uenv.rigid_solver
+    ratio = torch.empty(n, 1).uniform_(*friction, generator=g).repeat(1, solver.n_geoms)
+    ratio[0] = 1.0
+    solver.set_geoms_friction_ratio(ratio.to(gs.device), torch.arange(solver.n_geoms, device=gs.device), torch.arange(n, device=gs.device))
+    links = torch.as_tensor(uenv.object.coll_idxs_global)
+    shift = torch.empty(n, len(links)).uniform_(*obj_mass, generator=g)
+    shift[0] = 0.0
+    solver.set_links_mass_shift(shift.to(gs.device), links.to(gs.device), torch.arange(n, device=gs.device))
+    print(f"Randomized physics in envs 1..{n - 1}: friction ratio {friction}, object mass shift {obj_mass} kg")
 
 
 def main():
@@ -142,7 +175,8 @@ def main():
     parser.add_argument('--output_render', '-or', action='store_true') # if not ture, don't show the retargeted reference
     parser.add_argument('--render_dir', '-out', type=str, default="rendered") # if not provided, save in the same folder as the checkpoint
     parser.add_argument('--video_fname', '-of', type=str, default="-eval.mp4") # if not provided, save in the same folder as the checkpoint
-    parser.add_argument('--arti_tol', type=float, default=0.3, help='success if |lid angle - demo| stays below this (rad) for the whole episode')
+    parser.add_argument('--arti_tol', type=float, default=0.3, help='tracking success if |lid angle - demo| stays below this (rad) for the whole episode')
+    parser.add_argument('--rand_physics', action='store_true', help='perturb friction and object mass in envs 1.. (env 0 stays nominal); use with -B N+1 for N episodes')
     
     args = parser.parse_args()
 
@@ -253,6 +287,8 @@ def main():
     resume_path = os.path.abspath(args.checkpoint) 
     agent.restore(resume_path)
     agent.reset()
+    if args.rand_physics:
+        randomize_physics(uenv)
 
     for eps in range(args.eval_episodes):
         frames, eval_data = eval_one_episode(
